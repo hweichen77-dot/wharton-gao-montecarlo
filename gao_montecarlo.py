@@ -32,13 +32,20 @@ CONFIG = {
     # which takes its spread and its year-to-year shape straight from history.
     # history_column only matters under bootstrap.
 
-    # Phase 1: growth portfolio, start 2027 -> start 2033.
-    "phase1": {"mean": 0.075, "std": 0.14, "dist": "lognormal",
+    # Phase 1: growth portfolio, start 2027 -> start 2033. 85/15 equity/bond.
+    "phase1": {"mean": 0.09, "std": 0.17, "dist": "lognormal",
                "history_column": "sp500_total_return"},
 
     # Phase 2: operating reserve (bond ladder), start 2033 -> start 2042.
-    "phase2": {"mean": 0.035, "std": 0.045, "dist": "lognormal",
+    "phase2": {"mean": 0.03, "std": 0.045, "dist": "lognormal",
                "history_column": "tbond_10y_return"},
+
+    # De-risking glidepath into the 2033 split. None disables it.
+    # Volatility in the last years before a hard funding date is what pushes
+    # paths below the reserve target, and a path that lands short cannot be
+    # rescued by any split rule. Trading late-stage upside for a thinner left
+    # tail is the only lever that raises the payment-success ceiling.
+    "phase1_glide": {"start_year": 2031, "end": {"mean": 0.05, "std": 0.08}},
 
     # Realized annual returns, 1928-2025, from Damodaran's histretSP dataset.
     "history_csv": "data/sp500_annual_returns.csv",
@@ -56,12 +63,18 @@ CONFIG = {
     "target_confidence": [0.95, 0.99],
 
     # Percentile band quoted to co-sponsors for the facility contribution.
-    "credible_range_pct": (10, 90),
+    "credible_range_pct": (20, 80),
 
     # 2031 co-sponsor conversation. None -> use the simulated median 2031 value.
     "as_of_2031_value": None,
     # Buffer assumed when reporting facility figures outside the sweep.
-    "base_buffer": 0.15,
+    # 13% is the solve for 95% confidence on a fully funded reserve.
+    "base_buffer": 0.13,
+
+    # Blended (mean, std) for candidate equity/bond mixes, used by the tradeoff table.
+    "allocation_grid": [("85/15", 0.090, 0.170), ("75/25", 0.082, 0.145),
+                        ("65/35", 0.074, 0.125), ("55/45", 0.066, 0.105),
+                        ("45/55", 0.058, 0.085), ("35/65", 0.050, 0.070)],
 
     "sensitivity_phase1_means": [0.055, 0.065, 0.075, 0.085, 0.095],
     "sensitivity_phase2_means": [0.020, 0.030, 0.035, 0.040, 0.050],
@@ -107,18 +120,41 @@ def block_bootstrap(rng, shape, history, mean, block):
     return h[idx.reshape(n_sims, -1)[:, :n_years]]
 
 
-def phase_returns(rng, cfg, phase_key, shape, mean=None):
-    """Draw returns for one phase, honoring that phase's distribution choice."""
+def glide_schedule(cfg, start_year, n_years, mean, std):
+    """Per-year (mean, std) as the portfolio de-risks toward the split year.
+
+    Each return year y gets t = (y - glide_start + 1) / (split_year - glide_start + 1),
+    clipped to [0, 1], and every parameter moves linearly from the growth mix to
+    the end mix as t goes from 0 to 1. Years before the glide starts keep the
+    full growth assumption.
+    """
+    g = cfg.get("phase1_glide")
+    years = np.arange(start_year, start_year + n_years)
+    if not g:
+        return np.full(n_years, mean), np.full(n_years, std)
+    span = cfg["split_year"] - g["start_year"] + 1
+    t = np.clip((years - g["start_year"] + 1) / span, 0.0, 1.0)
+    return mean + t * (g["end"]["mean"] - mean), std + t * (g["end"]["std"] - std)
+
+
+def phase_returns(rng, cfg, phase_key, shape, mean=None, start_year=None):
+    """Draw returns for one phase, honoring its distribution and any glidepath."""
     p = cfg[phase_key]
     m = p["mean"] if mean is None else mean
     if p["dist"] == "bootstrap":
+        # Bootstrap recenters the whole series on one mean, so the glidepath is
+        # not applied here. Resampling blocks under a moving target would mix
+        # two different claims about the return process.
         return block_bootstrap(rng, shape, load_history(cfg["history_csv"], p["history_column"]),
                                m, cfg["bootstrap_block"])
+    if phase_key == "phase1" and start_year is not None:
+        m, sd = glide_schedule(cfg, start_year, shape[1], m, p["std"])
+        return draw_returns(rng, shape, m, sd, p["dist"])
     return draw_returns(rng, shape, m, p["std"], p["dist"])
 
 
 def draw_returns(rng, shape, mean, std, dist):
-    """Simple annual returns, i.i.d.
+    """Simple annual returns. mean and std may be scalars or per-year arrays.
 
     normal:    R ~ N(mean, std). Can produce R < -100%, so it is floored at -99%.
     lognormal: 1+R is lognormal with the SAME arithmetic mean and std. Matching
@@ -126,12 +162,13 @@ def draw_returns(rng, shape, mean, std, dist):
                Preferred: returns stay above -100% and the compounding is right-skewed,
                which is how multi-year equity outcomes actually behave.
     """
+    mean, std = np.asarray(mean, dtype=float), np.asarray(std, dtype=float)
     if dist == "normal":
         return np.maximum(rng.normal(mean, std, shape), -0.99)
     if dist == "lognormal":
-        sigma2 = math.log(1.0 + (std ** 2) / ((1.0 + mean) ** 2))
-        mu = math.log(1.0 + mean) - 0.5 * sigma2
-        return np.exp(rng.normal(mu, math.sqrt(sigma2), shape)) - 1.0
+        sigma2 = np.log(1.0 + (std ** 2) / ((1.0 + mean) ** 2))
+        mu = np.log(1.0 + mean) - 0.5 * sigma2
+        return np.exp(rng.normal(mu, np.sqrt(sigma2), shape)) - 1.0
     raise ValueError(f"unknown dist: {dist}")
 
 
@@ -145,7 +182,8 @@ def simulate_accumulation(rng, cfg, phase1_mean=None):
     its year, so it earns that same year's return.
     """
     years = list(range(min(cfg["contributions"]), cfg["split_year"] + 1))
-    rets = phase_returns(rng, cfg, "phase1", (cfg["n_sims"], len(years) - 1), phase1_mean)
+    rets = phase_returns(rng, cfg, "phase1", (cfg["n_sims"], len(years) - 1), phase1_mean,
+                         start_year=years[0])
     return years, accumulate_path(cfg, rets)
 
 
@@ -162,9 +200,10 @@ def accumulate_path(cfg, rets):
     return path
 
 
-def grow_forward(rng, values, n_years, cfg, mean=None):
+def grow_forward(rng, values, n_years, cfg, mean=None, start_year=None):
     """Compound a set of starting values forward n_years with phase 1 returns."""
-    rets = phase_returns(rng, cfg, "phase1", (values.shape[0], n_years), mean)
+    rets = phase_returns(rng, cfg, "phase1", (values.shape[0], n_years), mean,
+                         start_year=start_year)
     return values * np.prod(1.0 + rets, axis=1)
 
 
@@ -226,6 +265,43 @@ def run_split(rng, v2033, cfg, buffer, phase2_mean=None):
     ok, ending = simulate_reserve(rng, reserve, cfg, phase2_mean)
     return {"buffer": buffer, "target": target, "success": ok.mean(),
             "facility": facility, "reserve": reserve, "ending": ending}
+
+
+def funded_success(rng, cfg, buffer, phase2_mean=None):
+    """P(all ten payments) GIVEN the reserve was funded to its full target.
+
+    Isolates sequence-of-returns risk inside the payout decade from the separate
+    risk that phase 1 never produced enough to fund the set-aside at all.
+    """
+    ok, _ = simulate_reserve(rng, np.full(cfg["n_sims"], reserve_target(cfg, buffer)),
+                             cfg, phase2_mean)
+    return float(ok.mean())
+
+
+def required_buffer_funded(rng_seed, cfg, confidence, hi=1.0):
+    """Smallest buffer reaching `confidence` for a reserve that starts fully funded.
+
+    This is the operating-commitment question on its own terms. It asks how much
+    cushion the ladder needs to survive a bad decade, holding aside the separate
+    question of whether phase 1 delivered enough to fund it. Unlike the
+    unconditional version this has no ceiling below 100%, because a large enough
+    funded reserve always survives.
+    """
+    def prob(b):
+        return funded_success(np.random.default_rng(rng_seed), cfg, b)
+
+    if prob(hi) < confidence:
+        return None
+    lo = 0.0
+    if prob(lo) >= confidence:
+        return 0.0
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        if prob(mid) >= confidence:
+            hi = mid
+        else:
+            lo = mid
+    return hi
 
 
 def required_buffer(rng_seed, v2033, cfg, confidence, phase2_mean=None, hi=3.0):
@@ -352,6 +428,12 @@ def main(cfg, charts=None):
                   f"bootstrap block {cfg['bootstrap_block']}y on {p['history_column']}")
         else:
             print(f"{name}  mean {p['mean']:.2%}  std {p['std']:.2%}  {p['dist']}")
+    g = cfg.get("phase1_glide")
+    if g:
+        print(f"phase 1 glidepath  from {g['start_year']} toward mean {g['end']['mean']:.2%} "
+              f"std {g['end']['std']:.2%} at {cfg['split_year']}")
+    else:
+        print("phase 1 glidepath  none (static allocation)")
     print(f"reserve discount rate {cfg['reserve_discount_rate']:.2%}")
     print(f"contributions {', '.join(f'{y}: ${v:,.0f}' for y, v in sorted(cfg['contributions'].items()))}")
     print(f"payments {cfg['n_payments']} x ${cfg['payment']:,.0f}, {cfg['split_year']}-{cfg['split_year'] + cfg['n_payments'] - 1}, annuity-due, not indexed")
@@ -374,29 +456,63 @@ def main(cfg, charts=None):
     print(f"  undiscounted total     {money(cfg['payment'] * cfg['n_payments'])}")
     print(f"  PV at {cfg['reserve_discount_rate']:.2%}            {money(pv)}   <- buffer 0%")
 
+    no_glide = dict(cfg, phase1_glide=None)
+    v_ng = simulate_accumulation(np.random.default_rng(seed), no_glide)[1][:, -1]
+
     print("\n" + "-" * 78)
     print("PAYMENT SUCCESS vs RESERVE BUFFER")
     print("-" * 78)
-    print(f"  {'buffer':>7}  {'reserve set-aside':>18}  {'P(all 10 paid)':>15}  {'median facility':>16}  {'median left 2042':>17}")
-    sweep = []
+    print(f"  {'buffer':>7}  {'reserve':>12}  {'glide on':>9}  {'glide off':>10}  "
+          f"{'funded only':>12}  {'med facility':>13}  {'med left 2042':>14}")
+    sweep, sweep_ng = [], []
     for b in cfg["buffer_sweep"]:
         r = run_split(np.random.default_rng(seed + 1), v2033, cfg, b)
+        r_ng = run_split(np.random.default_rng(seed + 1), v_ng, no_glide, b)
         sweep.append(r)
-        print(f"  {b:>6.0%}  {money(r['target'])}      {r['success']:>13.2%}  "
-              f"{money(np.median(r['facility']))}  {money(np.median(r['ending']))}")
+        sweep_ng.append(r_ng)
+        fs = funded_success(np.random.default_rng(seed + 1), cfg, b)
+        print(f"  {b:>6.0%}  {r['target']:>12,.0f}  {r['success']:>8.1%}  {r_ng['success']:>9.1%}  "
+              f"{fs:>11.1%}  {np.median(r['facility']):>13,.0f}  {np.median(r['ending']):>14,.0f}")
+    print("  'funded only' = P(all 10 paid) conditional on the reserve starting fully funded.")
 
-    print("\n  buffer required to hit target confidence:")
+    print("\n  buffer required for the FUNDED reserve to hit target confidence:")
+    for c in cfg["target_confidence"]:
+        bf = required_buffer_funded(seed + 1, cfg, c)
+        print(f"    {c:.0%}: buffer {bf:>6.1%}  -> reserve {money(reserve_target(cfg, bf))}")
+    print("  This is the operating-commitment guarantee. It is the number to quote for the")
+    print("  ten payments, because it is the one the reserve design actually controls.")
+
+    print("\n  buffer required for UNCONDITIONAL success (includes phase 1 shortfall):")
     for c in cfg["target_confidence"]:
         b, ceiling = required_buffer(seed + 1, v2033, cfg, c)
-        if b is None:
-            print(f"    {c:.0%}: NOT REACHABLE at any buffer - ceiling is {ceiling:.1%}")
-        else:
-            print(f"    {c:.0%}: buffer {b:>6.1%}  -> reserve {money(reserve_target(cfg, b))}  (ceiling {ceiling:.1%})")
+        b_ng, ceil_ng = required_buffer(seed + 1, v_ng, no_glide, c)
+        fmt = lambda x, cl: f"NOT REACHABLE (ceiling {cl:.1%})" if x is None else f"buffer {x:.1%}"
+        print(f"    {c:.0%}  glide on: {fmt(b, ceiling):<32} glide off: {fmt(b_ng, ceil_ng)}")
+        if b is not None:
+            print(f"          -> reserve {money(reserve_target(cfg, b))}")
+
+    print("\n" + "-" * 78)
+    print(f"FAILURE DECOMPOSITION (buffer {cfg['base_buffer']:.0%})")
+    print("-" * 78)
+    tgt = reserve_target(cfg, cfg["base_buffer"])
+    underfunded = float(np.mean(v2033 < tgt))
+    fs = funded_success(np.random.default_rng(seed + 1), cfg, cfg["base_buffer"])
+    total = run_split(np.random.default_rng(seed + 1), v2033, cfg, cfg["base_buffer"])["success"]
+    print(f"  P(2033 value < reserve of {money(tgt).strip()})   {underfunded:>7.1%}   phase 1 never funded the set-aside")
+    print(f"  P(ladder fails | reserve fully funded)    {1 - fs:>7.1%}   sequence risk inside the payout decade")
+    print(f"  P(all ten payments made)                  {total:>7.1%}")
+    print("\n  These are two different failures with two different fixes. Ladder failure is a")
+    print("  sequence problem inside the payout decade and the buffer controls it directly.")
+    print("  Underfunding is a phase 1 risk-level problem, and the buffer does nothing for")
+    print("  it. Quoting the first number as the funding risk leaves the second unstated.")
+
     cap = np.mean(v2033 >= reserve_target(cfg, 0.0))
     print(f"\n  P(2033 portfolio >= un-buffered reserve) = {cap:.1%}")
     print("  That is the hard ceiling on payment certainty. Buffer reallocates the 2033")
-    print("  portfolio; it cannot create one. Raising certainty past the ceiling needs a")
-    print("  lower phase 1 risk level (or a de-risking glidepath into 2033), not more buffer.")
+    print("  portfolio; it cannot create one. The glidepath trims this only slightly,")
+    print("  because the early full-risk years carry the most compounding and the most")
+    print("  downside. Moving the ceiling means a lower risk level throughout, which the")
+    print("  allocation tradeoff table below prices in facility dollars.")
 
     base_b = cfg["base_buffer"]
     base = run_split(np.random.default_rng(seed + 1), v2033, cfg, base_b)
@@ -413,7 +529,8 @@ def main(cfg, charts=None):
     print("-" * 78)
     print_dist("portfolio at start of 2031 (unconditional)", v2031)
     anchor = cfg["as_of_2031_value"] or float(np.median(v2031))
-    fwd = grow_forward(np.random.default_rng(seed + 2), np.full(cfg["n_sims"], anchor), 2, cfg)
+    fwd = grow_forward(np.random.default_rng(seed + 2), np.full(cfg["n_sims"], anchor), 2, cfg,
+                       start_year=2031)
     fac_fwd = np.maximum(fwd - base["target"], 0.0)
     print(f"  conditioning on a 2031 value of {money(anchor)}, two years of phase 1 returns:")
     print_dist(f"facility contribution in {cfg['split_year']}", fac_fwd)
@@ -452,6 +569,24 @@ def main(cfg, charts=None):
     print("  (facility barely moves with the phase 2 mean: the reserve is sized off the")
     print("   discount rate, not the realized reserve return, so phase 1 drives the range)")
 
+    print("\n" + "-" * 78)
+    print("ALLOCATION TRADEOFF - WHAT UNCONDITIONAL CERTAINTY ACTUALLY COSTS")
+    print("-" * 78)
+    print(f"  {'mix':>16} {'mean/std':>11} {'ceiling':>8} {'buf@%.0f%%' % (cfg['target_confidence'][0] * 100):>9} "
+          f"{'med V2033':>11} {'med facility':>13}")
+    for lbl, m, sd in cfg["allocation_grid"]:
+        alt = dict(cfg, phase1_glide=None, phase1=dict(cfg["phase1"], mean=m, std=sd))
+        va = simulate_accumulation(np.random.default_rng(seed + 5), alt)[1][:, -1]
+        b, ceiling = required_buffer(seed + 6, va, alt, cfg["target_confidence"][0])
+        fac = run_split(np.random.default_rng(seed + 6), va, alt, b if b is not None else base_b)["facility"]
+        print(f"  {lbl:>16} {m:>5.1%}/{sd:>4.0%} {ceiling:>7.1%} "
+              f"{('%.1f%%' % (b * 100)) if b is not None else 'n/a':>9} "
+              f"{np.median(va):>11,.0f} {np.median(fac):>13,.0f}")
+    print("\n  Unconditional certainty is bought almost entirely out of the facility")
+    print("  contribution. The ten payments consume most of what 450,000 of contributions")
+    print("  can safely produce in six years, so a portfolio conservative enough to make")
+    print("  them near-certain has little surplus left to give the residency.")
+
     lo_band = float(np.percentile(base["facility"], lo_p))
     hi_band = float(np.percentile(base["facility"], hi_p))
     bt = historical_backtest(cfg, (lo_band, hi_band), base_b)
@@ -470,11 +605,12 @@ def main(cfg, charts=None):
     print("  configured phase assumptions, which is the fairer test of the quoted band.")
 
     if cfg["save_charts"] if charts is None else charts:
-        make_charts(cfg, v2033, base, sweep)
+        funded = [funded_success(np.random.default_rng(seed + 1), cfg, b) for b in cfg["buffer_sweep"]]
+        make_charts(cfg, v2033, base, sweep, sweep_ng, funded)
     print("\ndone.")
 
 
-def make_charts(cfg, v2033, base, sweep):
+def make_charts(cfg, v2033, base, sweep, sweep_ng=None, funded=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -499,7 +635,16 @@ def make_charts(cfg, v2033, base, sweep):
         plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot([r["buffer"] for r in sweep], [r["success"] for r in sweep], marker="o", color="#1f4e79")
+    ax.plot([r["buffer"] for r in sweep], [r["success"] for r in sweep], marker="o",
+            color="#1f4e79", label="with glidepath")
+    if sweep_ng:
+        ax.plot([r["buffer"] for r in sweep_ng], [r["success"] for r in sweep_ng], marker="s",
+                color="#888888", ls="--", label="static allocation")
+    if funded:
+        ax.plot(cfg["buffer_sweep"], funded, marker="^", color="#2e7d32",
+                label="reserve funded (operating commitment only)")
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_ylim(0.4, 1.02)
     for c in cfg["target_confidence"]:
         ax.axhline(c, ls="--", lw=1, color="#c00000")
         ax.annotate(f"{c:.0%}", (0, c), textcoords="offset points", xytext=(2, 4), color="#c00000")
@@ -518,7 +663,7 @@ def selftest():
     assert abs(pv_annuity_due(100, 0.10, 1) - 100) < 1e-9
     assert abs(pv_annuity_due(100, 0.10, 2) - (100 + 100 / 1.10)) < 1e-9
 
-    cfg = dict(CONFIG, n_sims=1000)
+    cfg = dict(CONFIG, n_sims=1000, phase1_glide=None)
     cfg["phase1"] = {"mean": 0.08, "std": 0.0, "dist": "normal"}
     cfg["phase2"] = {"mean": 0.03, "std": 0.0, "dist": "normal"}
     cfg["reserve_discount_rate"] = 0.03
@@ -526,6 +671,13 @@ def selftest():
     v = simulate_accumulation(np.random.default_rng(0), cfg)[1][:, -1]
     expect = 300_000 * 1.08 ** 6 + 150_000 * 1.08 ** 5
     assert abs(v[0] - expect) < 1e-6, (v[0], expect)
+
+    # Same identity with the glidepath on, compounding the per-year schedule.
+    gz = dict(cfg, phase1_glide={"start_year": 2031, "end": {"mean": 0.05, "std": 0.0}})
+    gm = glide_schedule(gz, 2027, 6, 0.08, 0.0)[0]
+    vg = simulate_accumulation(np.random.default_rng(0), gz)[1][:, -1]
+    expect_g = 300_000 * np.prod(1 + gm) + 150_000 * np.prod(1 + gm[1:])
+    assert abs(vg[0] - expect_g) < 1e-6, (vg[0], expect_g)
 
     # Zero vol, reserve return == discount rate, no buffer: the ladder must fund
     # exactly ten payments and land on zero. This is the annuity identity.
@@ -559,6 +711,34 @@ def selftest():
     bt = historical_backtest(cfg3, (0.0, 1e12), 0.15)
     assert bt["as realized"]["in_band"] == 1.0
     assert bt["recentered"]["n_windows"] == len(h) - 6 + 1
+
+    # Glidepath: schedule matches a hand-computed linear interpolation, the
+    # pre-glide years are untouched, and de-risking narrows the 2033 spread.
+    gcfg = dict(CONFIG, n_sims=20_000)
+    gm, gs = glide_schedule(gcfg, 2027, 6, 0.09, 0.17)
+    assert np.allclose(gm, [0.09, 0.09, 0.09, 0.09, 0.09 - 0.04 / 3, 0.09 - 0.08 / 3])
+    assert np.allclose(gs, [0.17, 0.17, 0.17, 0.17, 0.14, 0.11])
+    assert np.allclose(glide_schedule(gcfg, 2031, 2, 0.09, 0.17)[1], [0.14, 0.11])
+    assert np.allclose(glide_schedule(dict(gcfg, phase1_glide=None), 2027, 6, 0.09, 0.17)[0], 0.09)
+
+    # Per-year mean/std vectors are honored column by column.
+    mv = np.array([0.02, 0.09, 0.15])
+    x = draw_returns(np.random.default_rng(5), (300_000, 3), mv, np.array([0.05, 0.1, 0.2]), "lognormal")
+    assert np.allclose(x.mean(axis=0), mv, atol=0.003), x.mean(axis=0)
+
+    v_g = simulate_accumulation(np.random.default_rng(6), gcfg)[1][:, -1]
+    v_s = simulate_accumulation(np.random.default_rng(6), dict(gcfg, phase1_glide=None))[1][:, -1]
+    assert v_g.std() < v_s.std(), (v_g.std(), v_s.std())
+
+    # A funded reserve can only do better than the unconditional case, and the
+    # funded solve is monotone in the buffer.
+    for b in (0.0, 0.1, 0.2):
+        uncond = run_split(np.random.default_rng(6), v_g, gcfg, b)["success"]
+        assert funded_success(np.random.default_rng(6), gcfg, b) >= uncond - 1e-9
+    fs = [funded_success(np.random.default_rng(6), gcfg, b) for b in (0.0, 0.1, 0.2, 0.3)]
+    assert all(a <= b + 1e-12 for a, b in zip(fs, fs[1:])), fs
+    assert abs(funded_success(np.random.default_rng(6), gcfg,
+                              required_buffer_funded(6, gcfg, 0.95)) - 0.95) < 0.01
 
     # Lognormal draws preserve the arithmetic mean and keep returns above -100%.
     x = draw_returns(np.random.default_rng(1), 400_000, 0.075, 0.14, "lognormal")

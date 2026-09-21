@@ -25,11 +25,25 @@ Every assumption lives in the `CONFIG` dict at the top of `gao_montecarlo.py`. N
 
 Three ways to generate annual returns, set per phase in `CONFIG` or for both at once with `--dist`.
 
-`lognormal` and `normal` draw i.i.d. years from a fitted distribution using the mean and standard deviation you configure. `bootstrap` resamples contiguous blocks of realized annual returns from `data/sp500_annual_returns.csv`, recentered so the series mean equals your configured mean. Spread, skew, fat tails, and the ordering of good and bad years all come from history. The standard deviation setting is ignored in that mode.
+`lognormal` and `normal` draw i.i.d. years from a fitted distribution using the mean and standard deviation you configure. Both accept per-year arrays, which is what the glidepath uses. `bootstrap` resamples contiguous blocks of realized annual returns from `data/sp500_annual_returns.csv`, recentered so the series mean equals your configured mean. Spread, skew, fat tails, and the ordering of good and bad years all come from history. The standard deviation setting is ignored in that mode.
 
 The CSV holds S&P 500 total returns and 10-year Treasury returns for 1928 through 2025, extracted from Aswath Damodaran's `histretSP` dataset at NYU Stern. Realized S&P arithmetic mean over that span is 11.9% with a 19.4% standard deviation, well above what anyone should project forward, which is why the bootstrap recenters on your assumption instead of inheriting history's level.
 
 Switching to bootstrap makes the case harder. Success ceiling drops from about 90% to about 80% and the odds of a zero facility contribution rise, because the historical spread is wider than a 14% assumption and bad years arrive in runs.
+
+## De-risking glidepath
+
+`phase1_glide` blends the growth assumption toward a conservative mix over the final years before the split. With the default `{"start_year": 2031, "end": {"mean": 0.05, "std": 0.08}}`, the 2027 through 2030 years keep 9% and 17%, 2031 runs at 7.7% and 14%, and 2032 at 6.3% and 11%. Set it to `None` for a static allocation.
+
+Be careful what you claim for it. The glidepath moves the payment-success ceiling from 88.5% to 88.9%, which is almost nothing, because the early full-risk years carry both the most compounding and the most downside. It does tighten the 2031 co-sponsor range, and the report prints a static-allocation column beside the glidepath column so the comparison is visible rather than asserted.
+
+## Two kinds of failure
+
+The report splits payment failure into its two causes instead of reporting one number.
+
+Phase 1 can end below the reserve target, in which case the set-aside was never funded and no split rule helps. Separately, a fully funded reserve can still run dry when weak returns arrive early in the payout decade, because a fixed $50,000 withdrawal against a shrinking balance is exposed to the order returns come in.
+
+The buffer controls the second one and does nothing about the first. The report solves for both: the buffer that gets a funded reserve to your target confidence, and the buffer needed unconditionally, which at most allocations is unreachable at any size.
 
 ## What it models
 
@@ -56,4 +70,6 @@ Overlapping windows are not independent trials. Read this as a sanity check on t
 
 ## The success ceiling
 
-At the default assumptions, payment success flattens near 90% and no buffer gets past it. Roughly one path in ten finishes 2033 below the reserve target itself, so the split has nothing to work with. A buffer moves money between the two pools, it cannot add money to the portfolio. Reaching 95% means lowering Phase 1 risk or de-risking into 2033, not setting aside more.
+At the default assumptions, payment success flattens near 89% and no buffer gets past it. Roughly one path in ten finishes 2033 below the reserve target itself, so the split has nothing to work with. A buffer moves money between the two pools, it cannot add money to the portfolio.
+
+The allocation tradeoff table prices what buying past that ceiling costs. Reaching 95% unconditionally needs a 35/65 mix, which cuts the median facility contribution from about 190k to about 28k. Ten payments of $50,000 consume most of what $450,000 can safely produce in six years, so the honest answer is to quote 95% on the funded reserve, state the portfolio-size risk separately, and show the tradeoff rather than claim a certainty the arithmetic does not support.
