@@ -14,12 +14,22 @@ Flags:
 ```
 --selftest              assertion checks (annuity identity, zero-vol exactness, monotonicity)
 --sims N                trial count, default 50,000
---dist normal|lognormal return distribution for both phases
+--dist normal|lognormal|bootstrap  return distribution for both phases
 --no-charts             skip the PNGs
 --chart-dir DIR         where to write them
 ```
 
 Every assumption lives in the `CONFIG` dict at the top of `gao_montecarlo.py`. Nothing below it needs editing to change a return assumption or a confidence target.
+
+## Return assumptions
+
+Three ways to generate annual returns, set per phase in `CONFIG` or for both at once with `--dist`.
+
+`lognormal` and `normal` draw i.i.d. years from a fitted distribution using the mean and standard deviation you configure. `bootstrap` resamples contiguous blocks of realized annual returns from `data/sp500_annual_returns.csv`, recentered so the series mean equals your configured mean. Spread, skew, fat tails, and the ordering of good and bad years all come from history. The standard deviation setting is ignored in that mode.
+
+The CSV holds S&P 500 total returns and 10-year Treasury returns for 1928 through 2025, extracted from Aswath Damodaran's `histretSP` dataset at NYU Stern. Realized S&P arithmetic mean over that span is 11.9% with an 19.4% standard deviation, well above what anyone should project forward, which is why the bootstrap recenters on your assumption instead of inheriting history's level.
+
+Switching to bootstrap makes the case harder. Success ceiling drops from about 90% to about 80% and the odds of a zero facility contribution rise, because the historical spread is wider than a 14% assumption and bad years arrive in runs.
 
 ## What it models
 
@@ -37,6 +47,12 @@ Taxes and inflation indexing of the payments are excluded, which the case allows
 Console report covering the 2033 portfolio distribution, payment success rate across a 0% to 30% buffer sweep, the buffer needed for a 95% or 99% target, the facility contribution distribution with a percentile band for co-sponsors, a 2031 forward-looking version of that band, and sensitivity tables over Phase 1 and Phase 2 return assumptions.
 
 The script also writes three PNGs to the working directory. One histogram of 2033 portfolio value, one of the facility contribution, and a line chart of success probability against buffer size.
+
+## Historical backtest
+
+The report replays every overlapping six-year window from 1928 to 2025 through the same contribution schedule, and every overlapping ten-year window through the reserve drawdown. It does this twice. Once on the raw series, and once with the series recentered on the configured means, which is the fairer test of whether the quoted percentile band covers realistic paths.
+
+Overlapping windows are not independent trials. Read this as a sanity check on the model's shape, not as a coverage guarantee.
 
 ## The success ceiling
 

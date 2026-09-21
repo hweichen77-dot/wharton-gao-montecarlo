@@ -11,7 +11,10 @@ Taxes and inflation indexing of the $50,000 payments are excluded, per the case.
 """
 
 import argparse
+import csv
 import math
+import os
+from functools import lru_cache
 
 import numpy as np
 
@@ -24,12 +27,25 @@ CONFIG = {
     "payment": 50_000.0,
     "n_payments": 10,
 
+    # dist is "lognormal", "normal", or "bootstrap".
+    # mean/std are ARITHMETIC simple annual returns. std is ignored under bootstrap,
+    # which takes its spread and its year-to-year shape straight from history.
+    # history_column only matters under bootstrap.
+
     # Phase 1: growth portfolio, start 2027 -> start 2033.
-    # mean/std are ARITHMETIC simple annual returns, i.i.d. across years.
-    "phase1": {"mean": 0.075, "std": 0.14, "dist": "lognormal"},
+    "phase1": {"mean": 0.075, "std": 0.14, "dist": "lognormal",
+               "history_column": "sp500_total_return"},
 
     # Phase 2: operating reserve (bond ladder), start 2033 -> start 2042.
-    "phase2": {"mean": 0.035, "std": 0.045, "dist": "lognormal"},
+    "phase2": {"mean": 0.035, "std": 0.045, "dist": "lognormal",
+               "history_column": "tbond_10y_return"},
+
+    # Realized annual returns, 1928-2025, from Damodaran's histretSP dataset.
+    "history_csv": "data/sp500_annual_returns.csv",
+    # Block length for the bootstrap. 1 resamples single years and throws away
+    # serial structure; longer blocks keep runs of good and bad years intact,
+    # which is what makes sequence-of-returns risk show up honestly.
+    "bootstrap_block": 3,
 
     # Discount rate used to size the reserve as the PV of the ten payments.
     # Set it at or below the reserve's expected return: discounting at the full
@@ -56,6 +72,50 @@ CONFIG = {
 
 
 # --- return generation -------------------------------------------------------
+
+@lru_cache(maxsize=8)
+def load_history(path, column):
+    """Realized annual returns as a float array, in chronological order."""
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    return np.array([float(r[column]) for r in rows])
+
+
+def block_bootstrap(rng, shape, history, mean, block):
+    """Resample contiguous blocks of realized returns, recentered on `mean`.
+
+    Two things this buys over a fitted normal or lognormal. The empirical
+    distribution carries real fat tails and skew instead of assumed ones, and
+    sampling in blocks keeps consecutive years together, so a 2000-2002 style
+    run can appear intact rather than being smoothed away by i.i.d. draws.
+
+    Blocks wrap around the end of the series (circular bootstrap) so that every
+    starting year is equally likely, including the last few.
+
+    Recentering shifts the whole series by a constant so its mean equals `mean`,
+    leaving spread and serial shape alone. The historical mean of the S&P is far
+    above any defensible forward assumption, so the level has to be set by the
+    analyst; the shape is what history is being asked for.
+    """
+    n_sims, n_years = shape
+    h = history - history.mean() + mean
+    n_blocks = -(-n_years // block)
+    starts = rng.integers(0, len(h), size=(n_sims, n_blocks))
+    idx = (starts[:, :, None] + np.arange(block)[None, None, :]) % len(h)
+    return h[idx.reshape(n_sims, -1)[:, :n_years]]
+
+
+def phase_returns(rng, cfg, phase_key, shape, mean=None):
+    """Draw returns for one phase, honoring that phase's distribution choice."""
+    p = cfg[phase_key]
+    m = p["mean"] if mean is None else mean
+    if p["dist"] == "bootstrap":
+        return block_bootstrap(rng, shape, load_history(cfg["history_csv"], p["history_column"]),
+                               m, cfg["bootstrap_block"])
+    return draw_returns(rng, shape, m, p["std"], p["dist"])
+
 
 def draw_returns(rng, shape, mean, std, dist):
     """Simple annual returns, i.i.d.
@@ -84,26 +144,27 @@ def simulate_accumulation(rng, cfg, phase1_mean=None):
     indexed from 2027 through split_year. A contribution lands at the start of
     its year, so it earns that same year's return.
     """
-    p1 = cfg["phase1"]
-    mean = p1["mean"] if phase1_mean is None else phase1_mean
     years = list(range(min(cfg["contributions"]), cfg["split_year"] + 1))
-    rets = draw_returns(rng, (cfg["n_sims"], len(years) - 1), mean, p1["std"], p1["dist"])
+    rets = phase_returns(rng, cfg, "phase1", (cfg["n_sims"], len(years) - 1), phase1_mean)
+    return years, accumulate_path(cfg, rets)
 
-    path = np.zeros((cfg["n_sims"], len(years)))
-    bal = np.zeros(cfg["n_sims"])
+
+def accumulate_path(cfg, rets):
+    """Apply an (n_paths, n_years) return matrix to the contribution schedule."""
+    years = list(range(min(cfg["contributions"]), cfg["split_year"] + 1))
+    path = np.zeros((rets.shape[0], len(years)))
+    bal = np.zeros(rets.shape[0])
     for i, yr in enumerate(years):
         bal = bal + cfg["contributions"].get(yr, 0.0)
         path[:, i] = bal
         if i < len(years) - 1:
             bal = bal * (1.0 + rets[:, i])
-    return years, path
+    return path
 
 
 def grow_forward(rng, values, n_years, cfg, mean=None):
     """Compound a set of starting values forward n_years with phase 1 returns."""
-    p1 = cfg["phase1"]
-    rets = draw_returns(rng, (values.shape[0], n_years),
-                        p1["mean"] if mean is None else mean, p1["std"], p1["dist"])
+    rets = phase_returns(rng, cfg, "phase1", (values.shape[0], n_years), mean)
     return values * np.prod(1.0 + rets, axis=1)
 
 
@@ -134,10 +195,8 @@ def simulate_reserve(rng, start_balances, cfg, phase2_mean=None):
     and there are no new contributions to repair it. A fixed payment against a
     shrinking balance means the withdrawal rate climbs every year a loss occurs.
     """
-    p2 = cfg["phase2"]
-    mean = p2["mean"] if phase2_mean is None else phase2_mean
-    rets = draw_returns(rng, (start_balances.shape[0], cfg["n_payments"]),
-                        mean, p2["std"], p2["dist"])
+    rets = phase_returns(rng, cfg, "phase2",
+                         (start_balances.shape[0], cfg["n_payments"]), phase2_mean)
 
     bal = start_balances.copy()
     ok = np.ones(start_balances.shape[0], dtype=bool)
@@ -201,6 +260,60 @@ def required_buffer(rng_seed, v2033, cfg, confidence, phase2_mean=None, hi=3.0):
     return hi, ceiling
 
 
+# --- historical backtest -----------------------------------------------------
+
+def rolling_windows(series, length):
+    """Every overlapping window of `length` consecutive years, oldest first."""
+    n = len(series) - length + 1
+    return series[np.arange(n)[:, None] + np.arange(length)[None, :]]
+
+
+def historical_backtest(cfg, band, buffer):
+    """Replay actual history instead of sampling from a fitted distribution.
+
+    Two passes. "as realized" uses the historical returns untouched, which is a
+    fair question (what would this plan have done in the past) but a biased one
+    for sizing, since the 1928-2025 S&P mean of about 11.9% is well above any
+    forward assumption a team should defend. "recentered" shifts the series to
+    the configured mean and keeps the historical spread and ordering, which is
+    the real test of whether the quoted band covers realistic paths.
+
+    Windows overlap, so these counts are not independent observations. Treat
+    them as a sanity check on the model's shape, not as a coverage guarantee.
+    """
+    n_acc = cfg["split_year"] - min(cfg["contributions"])
+    eq = load_history(cfg["history_csv"], cfg["phase1"]["history_column"])
+    bd = load_history(cfg["history_csv"], cfg["phase2"]["history_column"])
+    target = reserve_target(cfg, buffer)
+    out = {}
+
+    for label, shift_eq, shift_bd in [("as realized", 0.0, 0.0),
+                                      ("recentered", cfg["phase1"]["mean"] - eq.mean(),
+                                       cfg["phase2"]["mean"] - bd.mean())]:
+        w_eq = rolling_windows(eq + shift_eq, n_acc)
+        v = accumulate_path(cfg, w_eq)[:, -1]
+        fac = np.maximum(v - target, 0.0)
+
+        w_bd = rolling_windows(bd + shift_bd, cfg["n_payments"])
+        # Fully funded reserve, real ten-year bond sequences: does the ladder hold?
+        bal = np.full(w_bd.shape[0], target)
+        ok = np.ones(w_bd.shape[0], dtype=bool)
+        for t in range(cfg["n_payments"]):
+            ok &= bal >= cfg["payment"] - 1e-6
+            bal = np.maximum(bal - cfg["payment"], 0.0)
+            if t < cfg["n_payments"] - 1:
+                bal = bal * (1.0 + w_bd[:, t])
+
+        out[label] = {
+            "n_windows": len(v), "median_v": float(np.median(v)),
+            "worst_v": float(v.min()), "best_v": float(v.max()),
+            "in_band": float(((fac >= band[0]) & (fac <= band[1])).mean()),
+            "below": float((fac < band[0]).mean()), "above": float((fac > band[1]).mean()),
+            "reserve_ok": float(ok.mean()),
+        }
+    return out
+
+
 # --- reporting ---------------------------------------------------------------
 
 PCTS = [5, 25, 50, 75, 95]
@@ -231,8 +344,14 @@ def main(cfg, charts=None):
     print("LAURA GAO / CREATIVE RESIDENCY - MONTE CARLO")
     print("=" * 78)
     print(f"trials {cfg['n_sims']:,}   seed {seed}")
-    print(f"phase 1 growth   mean {cfg['phase1']['mean']:.2%}  std {cfg['phase1']['std']:.2%}  {cfg['phase1']['dist']}")
-    print(f"phase 2 reserve  mean {cfg['phase2']['mean']:.2%}  std {cfg['phase2']['std']:.2%}  {cfg['phase2']['dist']}")
+    for key, name in [("phase1", "phase 1 growth "), ("phase2", "phase 2 reserve")]:
+        p = cfg[key]
+        if p["dist"] == "bootstrap":
+            h = load_history(cfg["history_csv"], p["history_column"])
+            print(f"{name}  mean {p['mean']:.2%}  std {h.std(ddof=1):.2%} (historical)  "
+                  f"bootstrap block {cfg['bootstrap_block']}y on {p['history_column']}")
+        else:
+            print(f"{name}  mean {p['mean']:.2%}  std {p['std']:.2%}  {p['dist']}")
     print(f"reserve discount rate {cfg['reserve_discount_rate']:.2%}")
     print(f"contributions {', '.join(f'{y}: ${v:,.0f}' for y, v in sorted(cfg['contributions'].items()))}")
     print(f"payments {cfg['n_payments']} x ${cfg['payment']:,.0f}, {cfg['split_year']}-{cfg['split_year'] + cfg['n_payments'] - 1}, annuity-due, not indexed")
@@ -333,6 +452,23 @@ def main(cfg, charts=None):
     print("  (facility barely moves with the phase 2 mean: the reserve is sized off the")
     print("   discount rate, not the realized reserve return, so phase 1 drives the range)")
 
+    lo_band = float(np.percentile(base["facility"], lo_p))
+    hi_band = float(np.percentile(base["facility"], hi_p))
+    bt = historical_backtest(cfg, (lo_band, hi_band), base_b)
+    print("\n" + "-" * 78)
+    print(f"HISTORICAL BACKTEST - OVERLAPPING {n_acc}-YEAR WINDOWS, 1928-2025")
+    print("-" * 78)
+    print(f"  band being tested: p{lo_p}-p{hi_p} facility, {money(lo_band)} to {money(hi_band)}")
+    for label, r in bt.items():
+        print(f"\n  {label}  ({r['n_windows']} overlapping windows)")
+        print(f"    {cfg['split_year']} value   median {money(r['median_v'])}  worst {money(r['worst_v'])}  best {money(r['best_v'])}")
+        print(f"    facility inside band  {r['in_band']:>6.1%}   below {r['below']:.1%}   above {r['above']:.1%}")
+        print(f"    reserve funded ten payments in {r['reserve_ok']:.1%} of real {cfg['n_payments']}-year bond sequences")
+    print("\n  Windows overlap, so these are not independent trials. 'as realized' runs on the")
+    print("  raw series, whose S&P mean is far above any forward assumption worth defending;")
+    print("  'recentered' keeps the historical spread and ordering but sets the mean to the")
+    print("  configured phase assumptions, which is the fairer test of the quoted band.")
+
     if cfg["save_charts"] if charts is None else charts:
         make_charts(cfg, v2033, base, sweep)
     print("\ndone.")
@@ -402,6 +538,28 @@ def selftest():
     ok, _ = simulate_reserve(np.random.default_rng(0), short, cfg)
     assert not ok.any()
 
+    # Bootstrap: draws come only from the (recentered) history, the recentering
+    # hits the requested mean, and blocks stay contiguous in the source series.
+    h = load_history(CONFIG["history_csv"], "sp500_total_return")
+    assert len(h) > 50 and h.min() > -1.0
+    b = block_bootstrap(np.random.default_rng(3), (5000, 6), h, 0.075, 3)
+    assert abs(b.mean() - 0.075) < 0.01, b.mean()
+    allowed = np.round(h - h.mean() + 0.075, 9)
+    assert np.isin(np.round(b, 9), allowed).all()
+    pairs = {(round(x, 9), round(y, 9)) for x, y in zip(allowed, allowed[1:])}
+    pairs.add((round(allowed[-1], 9), round(allowed[0], 9)))
+    assert all((round(b[i, j], 9), round(b[i, j + 1], 9)) in pairs
+               for i in range(50) for j in (0, 3))
+
+    cfg3 = dict(CONFIG, n_sims=2000)
+    cfg3["phase1"] = dict(cfg3["phase1"], dist="bootstrap")
+    cfg3["phase2"] = dict(cfg3["phase2"], dist="bootstrap")
+    v3 = simulate_accumulation(np.random.default_rng(3), cfg3)[1][:, -1]
+    assert v3.min() > 0 and np.isfinite(v3).all()
+    bt = historical_backtest(cfg3, (0.0, 1e12), 0.15)
+    assert bt["as realized"]["in_band"] == 1.0
+    assert bt["recentered"]["n_windows"] == len(h) - 6 + 1
+
     # Lognormal draws preserve the arithmetic mean and keep returns above -100%.
     x = draw_returns(np.random.default_rng(1), 400_000, 0.075, 0.14, "lognormal")
     assert abs(x.mean() - 0.075) < 0.002 and abs(x.std() - 0.14) < 0.002
@@ -419,7 +577,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--sims", type=int)
-    ap.add_argument("--dist", choices=["normal", "lognormal"])
+    ap.add_argument("--dist", choices=["normal", "lognormal", "bootstrap"])
     ap.add_argument("--no-charts", action="store_true")
     ap.add_argument("--chart-dir")
     a = ap.parse_args()
