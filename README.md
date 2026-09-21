@@ -27,7 +27,7 @@ Three ways to generate annual returns, set per phase in `CONFIG` or for both at 
 
 `lognormal` and `normal` draw i.i.d. years from a fitted distribution using the mean and standard deviation you configure. `bootstrap` resamples contiguous blocks of realized annual returns from `data/sp500_annual_returns.csv`, recentered so the series mean equals your configured mean. Spread, skew, fat tails, and the ordering of good and bad years all come from history. The standard deviation setting is ignored in that mode.
 
-The CSV holds S&P 500 total returns and 10-year Treasury returns for 1928 through 2025, extracted from Aswath Damodaran's `histretSP` dataset at NYU Stern. Realized S&P arithmetic mean over that span is 11.9% with an 19.4% standard deviation, well above what anyone should project forward, which is why the bootstrap recenters on your assumption instead of inheriting history's level.
+The CSV holds S&P 500 total returns and 10-year Treasury returns for 1928 through 2025, extracted from Aswath Damodaran's `histretSP` dataset at NYU Stern. Realized S&P arithmetic mean over that span is 11.9% with a 19.4% standard deviation, well above what anyone should project forward, which is why the bootstrap recenters on your assumption instead of inheriting history's level.
 
 Switching to bootstrap makes the case harder. Success ceiling drops from about 90% to about 80% and the odds of a zero facility contribution rise, because the historical spread is wider than a 14% assumption and bad years arrive in runs.
 
